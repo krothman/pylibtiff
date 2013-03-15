@@ -10,6 +10,7 @@ import sys
 import time
 import numpy
 import tif_lzw
+import mmap
 
 from .utils import bytes2str
 from .tiff_data import tag_name2value, tag_value2type, tag_value2name, name2type, type2bytes, type2dtype
@@ -283,111 +284,118 @@ class TIFFimage:
             strip_info = strip_offsets, strip_byte_counts, strips_per_image, rows_per_strip, bytes_per_row
             image_directories.append((entries, strip_info, image))
 
-        tif = numpy.memmap(filename, dtype=numpy.ubyte, mode='w+', shape=(total_size,))
-        def tif_write(tif, offset, data, tifs=[]):
-            end = offset + data.nbytes
-            if end > tif.size:
-                size_incr = int((end - tif.size)/1024**2 + 1)*1024**2
-                new_size = tif.size + size_incr
-                assert end <= new_size, `end, tif.size, size_incr, new_size`
-                #sys.stdout.write('resizing: %s -> %s\n' % (tif.size, new_size))
-                #tif.resize(end, refcheck=False)
-                tif._mmap.resize(new_size)
-                new_tif = numpy.ndarray.__new__(numpy.memmap, (tif._mmap.size(), ),
-                                                dtype = tif.dtype, buffer=tif._mmap)
-                new_tif._parent = tif
-                new_tif.__array_finalize__(tif)
-                tif = new_tif
-            tif[offset:end] = data
-            return tif
-        # write TIFF header
-        tif[:2].view(dtype=numpy.uint16)[0] = 0x4949 # low-endian
-        tif[2:4].view (dtype=numpy.uint16)[0] = 42   # magic number
-        tif[4:8].view (dtype=numpy.uint32)[0] = 8    # offset to the first IFD
+        try:
+            fd = os.open(filename, os.O_CREAT | os.O_RDWR | os.O_TRUNC)
+            os.ftruncate(fd, total_size)
+            buf = mmap.mmap(fd, total_size)
+            tif = numpy.ndarray((total_size,), numpy.ubyte, buf)
+            #tif = numpy.memmap(filename, dtype=numpy.ubyte, mode='w+', shape=(total_size,))
+            def tif_write(tif, offset, data, buf, tifs=[]):
+                end = offset + data.nbytes
+                if end > tif.size:
+                    size_incr = int((end - tif.size)/1024**2 + 1)*1024**2
+                    new_size = tif.size + size_incr
+                    assert end <= new_size, `end, tif.size, size_incr, new_size`
+                    #sys.stdout.write('resizing: %s -> %s\n' % (tif.size, new_size))
+                    #tif.resize(end, refcheck=False)
+                    buf.close()
+                    os.ftruncate(fd, new_size)
+                    buf = mmap.mmap(fd, new_size)
+                    tif = numpy.ndarray((buf.size(),), tif.dtype, buf)
+                tif[offset:end] = data
+                return (tif, buf)
+            # write TIFF header
+            tif[:2].view(dtype=numpy.uint16)[0] = 0x4949 # low-endian
+            tif[2:4].view (dtype=numpy.uint16)[0] = 42   # magic number
+            tif[4:8].view (dtype=numpy.uint32)[0] = 8    # offset to the first IFD
 
-        offset = 8
-        data_offset = total_size - data_size
-        image_data_offset = total_size - image_data_size
-        first_data_offset = data_offset
-        first_image_data_offset = image_data_offset
-        start_time = time.time ()
-        compressed_data_size = 0
-        for i, (entries, strip_info, image) in enumerate(image_directories):
-            strip_offsets, strip_byte_counts, strips_per_image, rows_per_strip, bytes_per_row = strip_info
+            offset = 8
+            data_offset = total_size - data_size
+            image_data_offset = total_size - image_data_size
+            first_data_offset = data_offset
+            first_image_data_offset = image_data_offset
+            start_time = time.time ()
+            compressed_data_size = 0
+            for i, (entries, strip_info, image) in enumerate(image_directories):
+                strip_offsets, strip_byte_counts, strips_per_image, rows_per_strip, bytes_per_row = strip_info
 
-            # write the nof IFD entries
-            tif[offset:offset+2].view(dtype=numpy.uint16)[0] = len(entries)
-            offset += 2
-            assert offset <= first_data_offset,`offset, first_data_offset`
+                # write the nof IFD entries
+                tif[offset:offset+2].view(dtype=numpy.uint16)[0] = len(entries)
+                offset += 2
+                assert offset <= first_data_offset,`offset, first_data_offset`
 
-            # write image data
-            data = image.view(dtype=numpy.ubyte).reshape((image.nbytes,))
-            
-            for j in range(strips_per_image):
-                c = rows_per_strip * bytes_per_row
-                k = j * c
-                c -= max((j+1) * c - image.nbytes, 0)
-                assert c>0,`c`
-                orig_strip = data[k:k+c]
-                strip = compress(orig_strip)
-                if validate:
-                    test_strip = decompress(strip, orig_strip.nbytes)
-                    if (orig_strip!=test_strip).any():
-                        raise RuntimeError('Compressed data is corrupted: cannot recover original data')
-                compressed_data_size += strip.nbytes
-                #print strip.size, strip.nbytes, strip.shape, tif[image_data_offset:image_data_offset+strip.nbytes].shape
-                strip_offsets.add_value(image_data_offset)
-                strip_byte_counts.add_value(strip.nbytes)
+                # write image data
+                data = image.view(dtype=numpy.ubyte).reshape((image.nbytes,))
+                
+                for j in range(strips_per_image):
+                    c = rows_per_strip * bytes_per_row
+                    k = j * c
+                    c -= max((j+1) * c - image.nbytes, 0)
+                    assert c>0,`c`
+                    orig_strip = data[k:k+c]
+                    strip = compress(orig_strip)
+                    if validate:
+                        test_strip = decompress(strip, orig_strip.nbytes)
+                        if (orig_strip!=test_strip).any():
+                            raise RuntimeError('Compressed data is corrupted: cannot recover original data')
+                    compressed_data_size += strip.nbytes
+                    #print strip.size, strip.nbytes, strip.shape, tif[image_data_offset:image_data_offset+strip.nbytes].shape
+                    strip_offsets.add_value(image_data_offset)
+                    strip_byte_counts.add_value(strip.nbytes)
 
-                tif = tif_write(tif, image_data_offset, strip)
-                image_data_offset += strip.nbytes
-                # if j==0:
-                #     first = strip_offsets[0]
-                # last = strip_offsets[-1] + strip_byte_counts[-1]
-
-
-            # write IFD entries
-            for entry in entries:
-                data_size = entry.nbytes
-                if data_size:
-                    entry.set_offset(data_offset)
-                    assert data_offset+data_size <= total_size, `data_offset+data_size,total_size`
-                    r = entry.toarray(tif[data_offset:data_offset + data_size])
-                    assert r.nbytes==data_size
-                    data_offset += data_size
-                    assert data_offset <= first_image_data_offset,`data_offset, first_image_data_offset, i`
-                tif[offset:offset+12] = entry.record
-                offset += 12
-                assert offset <= first_data_offset,`offset, first_data_offset, i`
-
-            # write offset to the next IFD
-            tif[offset:offset+4].view(dtype=numpy.uint32)[0] = offset + 4
-            offset += 4
-            assert offset <= first_data_offset,`offset, first_data_offset`
-
-            if verbose:
-                sys.stdout.write('\r  filling records: %5s%% done (%s/s)%s' \
-                                     % (int(100.0*(i+1)/len(image_directories)),
-                                        bytes2str(int((image_data_offset-first_image_data_offset)/(time.time ()-start_time))),
-                                        ' '*2))
-                if (i+1)==len (image_directories):
-                    sys.stdout.write ('\n')
-                sys.stdout.flush ()
+                    (tif, buf) = tif_write(tif, image_data_offset, strip, buf)
+                    image_data_offset += strip.nbytes
+                    # if j==0:
+                    #     first = strip_offsets[0]
+                    # last = strip_offsets[-1] + strip_byte_counts[-1]
 
 
-        # last offset must be 0
-        tif[offset-4:offset].view(dtype=numpy.uint32)[0] = 0
+                # write IFD entries
+                for entry in entries:
+                    data_size = entry.nbytes
+                    if data_size:
+                        entry.set_offset(data_offset)
+                        assert data_offset+data_size <= total_size, `data_offset+data_size,total_size`
+                        r = entry.toarray(tif[data_offset:data_offset + data_size])
+                        assert r.nbytes==data_size
+                        data_offset += data_size
+                        assert data_offset <= first_image_data_offset,`data_offset, first_image_data_offset, i`
+                    tif[offset:offset+12] = entry.record
+                    offset += 12
+                    assert offset <= first_data_offset,`offset, first_data_offset, i`
 
-        compression = 1/(compressed_data_size/image_data_size)
+                # write offset to the next IFD
+                tif[offset:offset+4].view(dtype=numpy.uint32)[0] = offset + 4
+                offset += 4
+                assert offset <= first_data_offset,`offset, first_data_offset`
 
-        if compressed_data_size != image_data_size:
-            sdiff = image_data_size - compressed_data_size
-            total_size -= sdiff
-            tif._mmap.resize(total_size)
-            if verbose:
-                sys.stdout.write('  resized records: %s -> %s (compression: %.2fx)\n' \
-                                     % (bytes2str(total_size + sdiff), bytes2str(total_size),
-                                        compression))
-                sys.stdout.flush ()
-        del tif # flushing
+                if verbose:
+                    sys.stdout.write('\r  filling records: %5s%% done (%s/s)%s' \
+                                        % (int(100.0*(i+1)/len(image_directories)),
+                                            bytes2str(int((image_data_offset-first_image_data_offset)/(time.time ()-start_time))),
+                                            ' '*2))
+                    if (i+1)==len (image_directories):
+                        sys.stdout.write ('\n')
+                    sys.stdout.flush ()
+
+
+            # last offset must be 0
+            tif[offset-4:offset].view(dtype=numpy.uint32)[0] = 0
+
+            compression = 1/(compressed_data_size/image_data_size)
+
+            if compressed_data_size != image_data_size:
+                sdiff = image_data_size - compressed_data_size
+                total_size -= sdiff
+                os.ftruncate(fd, total_size)
+                if verbose:
+                    sys.stdout.write('  resized records: %s -> %s (compression: %.2fx)\n' \
+                                        % (bytes2str(total_size + sdiff), bytes2str(total_size),
+                                            compression))
+                    sys.stdout.flush ()
+            del tif # flushing
+        finally:
+            buf.close()
+            os.close(fd)
+
         return compression
