@@ -45,7 +45,7 @@
 
 
 #include <Python.h>
-#define NPY_NO_DEPRECATED_API
+//#define NPY_NO_DEPRECATED_API
 #define PY_ARRAY_UNIQUE_SYMBOL PyArray_API
 #include "numpy/arrayobject.h"
 

@@ -68,11 +68,14 @@ if tiff_h is None:
     d = {}
     for line in f.readlines():
         if not line.startswith('#define'): continue
-        words = line[7:].lstrip().split()[:2]
-        if len (words)!=2: continue
-        name, value = words
+        words = line[7:].lstrip().split()
+        name = words[0]
+        value = ' '.join(words[1:]).strip()
+        if value == '':
+            continue
         i = value.find('/*')
         if i!=-1: value = value[:i]
+        value = value.strip()
         if value in d:
             value = d[value]
         else:
